@@ -79,6 +79,7 @@ class DistributedCodegen : public CodegenBase {
   void VisitExpr_(const ir::ConstIntPtr& op) override;
   void VisitExpr_(const ir::ConstFloatPtr& op) override;
   void VisitExpr_(const ir::ConstBoolPtr& op) override;
+  void VisitExpr_(const ir::TupleGetItemExprPtr& op) override;
 
  private:
   // Code structure emission

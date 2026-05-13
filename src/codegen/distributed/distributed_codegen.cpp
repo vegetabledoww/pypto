@@ -304,7 +304,9 @@ void DistributedCodegen::VisitStmt_(const ir::AssignStmtPtr& op) {
   VisitExpr(op->value_);
 
   if (!current_expr_value_.empty()) {
-    emitter_.EmitLine(var_name + " = " + current_expr_value_);
+    bool is_tensor_ref = (current_expr_value_.rfind("tensors[\"", 0) == 0);
+    std::string lhs = is_tensor_ref ? ("tensors[\"" + var_name + "\"]") : var_name;
+    emitter_.EmitLine(lhs + " = " + current_expr_value_);
     declared_vars_.insert(var_name);
     current_expr_value_ = "";
   }
@@ -451,6 +453,17 @@ void DistributedCodegen::VisitExpr_(const ir::VarPtr& op) {
   current_expr_value_ = SanitizeName(op->name_hint_);
 }
 
+void DistributedCodegen::VisitExpr_(const ir::TupleGetItemExprPtr& op) {
+  INTERNAL_CHECK(op != nullptr) << "Internal error: null TupleGetItemExpr";
+  std::string tuple_name = TryGetVarName(op->tuple_);
+  if (!tuple_name.empty() && declared_vars_.count(SanitizeName(tuple_name))) {
+    std::string indexed_key = SanitizeName(tuple_name) + "_" + std::to_string(op->index_);
+    current_expr_value_ = "tensors[\"" + indexed_key + "\"]";
+  } else {
+    current_expr_value_ = CodegenBase::GenerateExprString(op);
+  }
+}
+
 void DistributedCodegen::VisitExpr_(const ir::ConstIntPtr& op) {
   INTERNAL_CHECK(op != nullptr) << "Internal error: null ConstInt";
   current_expr_value_ = std::to_string(op->value_);
@@ -545,19 +558,35 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
   }
 
   // If this call has an assignment target (return value), alias it to the OUT
-  // parameter tensor.  In simpler's runtime model, the callee writes in-place
-  // to the OUT parameter, so the return value is the same tensor.
+  // parameter tensor(s).  For tuple returns with multiple Out params, emit
+  // indexed entries (_tmp_0, _tmp_1, ...) so each TupleGetItem(index) can
+  // resolve to the correct output buffer.
   if (!target.empty() && !callee->return_types_.empty()) {
-    // Find the first Out/InOut parameter — that is the tensor the return value aliases
+    std::vector<size_t> out_param_indices;
     for (size_t i = 0; i < callee->param_directions_.size() && i < call->args_.size(); ++i) {
       if (callee->param_directions_[i] == ir::ParamDirection::Out ||
           callee->param_directions_[i] == ir::ParamDirection::InOut) {
-        VisitExpr(call->args_[i]);
+        out_param_indices.push_back(i);
+      }
+    }
+    bool is_tuple_return = (callee->return_types_.size() > 1) ||
+                           (std::dynamic_pointer_cast<const ir::TupleType>(callee->return_types_.front()) != nullptr);
+    if (is_tuple_return && out_param_indices.size() > 1) {
+      for (size_t idx = 0; idx < out_param_indices.size(); ++idx) {
+        size_t pi = out_param_indices[idx];
+        VisitExpr(call->args_[pi]);
         std::string out_arg = current_expr_value_;
         current_expr_value_ = "";
-        emitter_.EmitLine("tensors[\"" + target + "\"] = tensors[\"" + out_arg + "\"]");
-        break;
+        std::string indexed_target = target + "_" + std::to_string(idx);
+        emitter_.EmitLine("tensors[\"" + indexed_target + "\"] = tensors[\"" + out_arg + "\"]");
       }
+      emitter_.EmitLine("tensors[\"" + target + "\"] = tensors[\"" + target + "_0" + "\"]");
+    } else if (!out_param_indices.empty()) {
+      size_t pi = out_param_indices[0];
+      VisitExpr(call->args_[pi]);
+      std::string out_arg = current_expr_value_;
+      current_expr_value_ = "";
+      emitter_.EmitLine("tensors[\"" + target + "\"] = tensors[\"" + out_arg + "\"]");
     }
   }
 }
